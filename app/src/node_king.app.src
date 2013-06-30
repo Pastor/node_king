@@ -1,0 +1,13 @@
+{application, node_king,
+ [
+  {description, "King node"},
+  {vsn, "0.1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  mnesia
+                 ]},
+  {mod, { node_king_app, []}},
+  {env, []}
+ ]}.

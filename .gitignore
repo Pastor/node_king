@@ -1,5 +1,7 @@
 .eunit
 deps
+ddb
 *.o
 *.beam
 *.plt
+.dialyzer_plt
