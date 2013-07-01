@@ -19,11 +19,13 @@ open(CONFIG, '>node_king.config') and do {
     my $port = 9090 + int($in);
     my $type = int(rand(3));
     my $id = int(rand(10));
+    my $self = 'false';
 
+    $self = 'true' if $in == 5;
     $nodes{$id} = 0 unless exists $nodes{$id};
     ++$nodes{$id};
 
-    print CONFIG qq|{"$uuid", "$name", "$ip", $port, $type, $id, false}.\n|;
+    print CONFIG qq|{"$uuid", "$name", "$ip", $port, $type, $id, $self}.\n|;
   }
   close(CONFIG);
 };

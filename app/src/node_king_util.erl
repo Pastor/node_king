@@ -3,8 +3,9 @@
 
 -include("kntable.hrl").
 
--export([get_nodes_when/2, get_config_from_file/1]).
+-export([get_nodes_when/2, get_config_from_file/1, launch_periodic/4, launch_process/4]).
 
+-define(PERIODIC_CIRCLE, 4).
 -record(config_readed, {self = none, list = []}).
 
 %% @doc ...
@@ -65,9 +66,158 @@ config_each_line(Device, Func, Accum) ->
       config_each_line(Device, Func, Accum0)
   end.
 
+%% @doc 
+%%-spec periodic_func(PeriodicContext :: any()) -> 
+%%  {ok, PeriodicContext :: any()} | {error, Reason :: string(), PeriodicContext :: any()}.
+-record(launch_context, {periodic_context = [], failure_count = 0, success_count = 0}).
+
+-spec launch_periodic(PeriodicFunc :: any(), FailureFunc :: any(), Timeout :: integer(), PeriodicContext :: any()) -> 
+  {ok, pid()} | {error, Reason :: string()}.
+launch_periodic(PeriodicFunc, FailureFunc, Timeout, PeriodicContext) ->  
+  Pid = spawn(?MODULE, launch_process, [PeriodicFunc, FailureFunc, Timeout, #launch_context{periodic_context = PeriodicContext}]),
+  {ok, Pid}.
+
+-spec launch_process(PeriodicFunc :: any(), FailureFunc :: any(), Timeout :: integer(), #launch_context{}) -> 
+  {ok, aborted, any()}.
+launch_process(PeriodicFunc, FailureFunc, Timeout, #launch_context{failure_count = ErrorCount, success_count = SuccessCount} = LaunchContext) ->
+  receive
+    {terminate, Pid} ->
+      Pid ! {ok, terminate, LaunchContext};
+    {reboot, _Pid} ->
+      launch_process(PeriodicFunc, FailureFunc, Timeout, LaunchContext)
+  after Timeout ->
+    Result = if
+      ErrorCount >= ?PERIODIC_CIRCLE ->
+        FailureFunc(LaunchContext#launch_context.periodic_context);
+      true ->
+        PeriodicFunc(LaunchContext#launch_context.periodic_context)              
+    end,
+    case Result of
+      {ok, PeriodicContext0} ->
+        launch_process(
+          PeriodicFunc, 
+          FailureFunc, 
+          Timeout, 
+          LaunchContext#launch_context{
+            periodic_context = PeriodicContext0, 
+            failure_count = 0, 
+            success_count = SuccessCount + 1
+          }
+        );      
+      {error, Reason, PeriodicContext0} ->
+        io:format("Error: ~p~n", [Reason]),
+        launch_process(
+          PeriodicFunc, 
+          FailureFunc, 
+          Timeout, 
+          LaunchContext#launch_context{
+            periodic_context = PeriodicContext0, 
+            failure_count = ErrorCount + 1
+          }
+        )
+    end
+  end,
+  {ok, aborted, LaunchContext}.
+
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+-spec launch_periodic_test_() -> [any()].
+launch_periodic_test_() ->
+  SuccessPeriodicFunc = fun(PeriodicContext) -> {ok, PeriodicContext} end,
+  FailurePeriodicFunc = fun(PeriodicContext) -> {error, "Test failure", PeriodicContext} end,
+  SuccessFailureFunc = SuccessPeriodicFunc,
+  FailureFailureFunc = FailurePeriodicFunc,
+  Timeout = 100,
+  SuccessCircle = 10,
+  FailureCircle = 1,
+  OnFailSuccessCircle = ?PERIODIC_CIRCLE + 1,
+  OnFailureCircle = 10,
+  [
+    {"Success",
+     fun() ->
+       SuccessTimeout = (SuccessCircle * Timeout) + Timeout,
+       {ok, Pid} = launch_periodic(SuccessPeriodicFunc, SuccessFailureFunc, Timeout, undefined),
+       receive
+       after SuccessTimeout ->
+         Pid ! {terminate, self()},
+         receive
+           {ok, terminate, LaunchContext} ->
+             ?assertEqual(LaunchContext#launch_context.success_count, SuccessCircle);
+           _ ->
+             ?assertEqual(1, 0)
+         after 10000 ->
+           ?assertEqual(1, 0)
+         end
+       end,
+       ?assertEqual(1, 1)
+     end
+    },
+    {"Failure",
+     fun() ->
+       %% 1 - success call
+       FailureTimeout = (FailureCircle * Timeout) + Timeout,
+       {ok, Pid} = launch_periodic(FailurePeriodicFunc, SuccessFailureFunc, Timeout, undefined),
+       receive
+       after FailureTimeout ->
+         Pid ! {terminate, self()},
+         receive
+           {ok, terminate, LaunchContext} ->
+             ?assertEqual(LaunchContext#launch_context.failure_count, FailureCircle);
+           _ ->
+             ?assertEqual(1, 0)
+         after 10000 ->
+           ?assertEqual(1, 0)
+         end
+       end,
+       ?assertEqual(1, 1)
+     end
+    },
+    {"OnFailSuccess",
+     fun() ->
+       OnFailSuccessTimeout = (OnFailSuccessCircle * Timeout) + Timeout,
+       {ok, Pid} = launch_periodic(FailurePeriodicFunc, SuccessFailureFunc, Timeout, undefined),
+       receive
+       after OnFailSuccessTimeout ->
+         Pid ! {terminate, self()},
+         receive
+           {ok, terminate, LaunchContext} ->
+             #launch_context{failure_count = FailureCount, success_count = SuccessCount} = LaunchContext,
+             ?assertEqual(FailureCount, 0),
+             ?assertEqual(SuccessCount, 1);
+           _ ->
+             ?assertEqual(1, 0)
+         after 10000 ->
+           ?assertEqual(1, 0)
+         end
+       end,
+       ?assertEqual(1, 1)
+     end
+    },
+    {"OnFailure",
+     fun() ->
+       OnFailureTimeout = (OnFailureCircle * Timeout) + Timeout,
+       {ok, Pid} = launch_periodic(FailurePeriodicFunc, FailureFailureFunc, Timeout, undefined),
+       receive
+       after OnFailureTimeout ->
+         Pid ! {terminate, self()},
+         receive
+           {ok, terminate, LaunchContext} ->
+             #launch_context{failure_count = FailureCount, success_count = SuccessCount} = LaunchContext,
+             ?assertEqual(FailureCount, OnFailureCircle),
+             ?assertEqual(SuccessCount, 0);
+           _ ->
+             ?assertEqual(1, 0)
+         after 10000 ->
+           ?assertEqual(1, 0)
+         end
+       end,
+       ?assertEqual(1, 1)
+     end
+    }
+
+  ].
 
 -spec get_config_from_file_test() -> [any()].
 get_config_from_file_test() ->
@@ -75,9 +225,9 @@ get_config_from_file_test() ->
   ConfigFile = [Cwd ++ "/../../node_king.config"],
   {ok, Result} = get_config_from_file(ConfigFile),
   ?assertEqual(9, length(Result#config_readed.list)),
+  Self0 =  Result#config_readed.self,
   ?assertEqual(
     #knode{
-      uuid = "D22F742F-6C03-1014-9F8A-EA4D69957277", 
       name = "nodeking006", 
       host = "localhost", 
       port = 9095, 
@@ -85,7 +235,7 @@ get_config_from_file_test() ->
       id   = 7, 
       self = true 
     }, 
-    Result#config_readed.self
+    Self0#knode{uuid = undefined}
   ).
 
 -spec get_nodes_then_test_() -> [any()].
