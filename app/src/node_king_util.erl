@@ -16,7 +16,7 @@ get_nodes_when(List, Id) ->
   SortFunc = fun(#knode{id = Id1}, #knode{id = Id2}) -> Id1 < Id2 end,
   lists:sort(SortFunc, CutList).
 
--spec get_config_from_file(string()) -> {ok, #config_readed{}} | {error, string()}.
+-spec get_config_from_file(string()) -> {ok, #config_readed{}}.
 get_config_from_file(FileName) ->
   ParseTermsFunc = fun
     (#knode{self = true} = Node, #config_readed{list = List}) ->
@@ -29,8 +29,6 @@ get_config_from_file(FileName) ->
   Result = case file:open(FileName, [read]) of
     {ok, Device} ->
       config_each_line(Device, fun
-        ([ <<'%'>> | _], ConfigReaded) ->
-          ConfigReaded;
         (Line, ConfigReaded) ->
           {ok, Tokens, _} = erl_scan:string(Line),
           case Tokens of
@@ -55,7 +53,7 @@ get_config_from_file(FileName) ->
   end, 
   {ok, Result}. 
   
--spec config_each_line(any(), any(), #config_readed{}) -> #config_readed{}.
+-spec config_each_line(any(), fun(), #config_readed{}) -> #config_readed{}.
 config_each_line(Device, Func, Accum) ->
   case io:get_line(Device, "") of
     eof -> 
@@ -71,14 +69,14 @@ config_each_line(Device, Func, Accum) ->
 %%  {ok, PeriodicContext :: any()} | {error, Reason :: string(), PeriodicContext :: any()}.
 -record(launch_context, {periodic_context = [], failure_count = 0, success_count = 0}).
 
--spec launch_periodic(PeriodicFunc :: any(), FailureFunc :: any(), Timeout :: integer(), PeriodicContext :: any()) -> 
-  {ok, pid()} | {error, Reason :: string()}.
+-spec launch_periodic(fun(), fun(), integer(), any()) -> 
+  {'ok', pid()}.
 launch_periodic(PeriodicFunc, FailureFunc, Timeout, PeriodicContext) ->  
   Pid = spawn(?MODULE, launch_process, [PeriodicFunc, FailureFunc, Timeout, #launch_context{periodic_context = PeriodicContext}]),
   {ok, Pid}.
 
--spec launch_process(PeriodicFunc :: any(), FailureFunc :: any(), Timeout :: integer(), #launch_context{}) -> 
-  {ok, aborted, any()}.
+-spec launch_process(fun(), fun(), integer(), #launch_context{}) -> 
+  {'ok', 'aborted', any()}.
 launch_process(PeriodicFunc, FailureFunc, Timeout, #launch_context{failure_count = ErrorCount, success_count = SuccessCount} = LaunchContext) ->
   receive
     {terminate, Pid} ->
@@ -119,7 +117,6 @@ launch_process(PeriodicFunc, FailureFunc, Timeout, #launch_context{failure_count
   end,
   {ok, aborted, LaunchContext}.
 
-
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -129,7 +126,7 @@ launch_periodic_test_() ->
   FailurePeriodicFunc = fun(PeriodicContext) -> {error, "Test failure", PeriodicContext} end,
   SuccessFailureFunc = SuccessPeriodicFunc,
   FailureFailureFunc = FailurePeriodicFunc,
-  Timeout = 100,
+  Timeout = 200,
   SuccessCircle = 10,
   FailureCircle = 1,
   OnFailSuccessCircle = ?PERIODIC_CIRCLE + 1,
