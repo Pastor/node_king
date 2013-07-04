@@ -10,13 +10,13 @@
 -define(CONFIG_FILENAME, "node_king.config").
 -define(KING_ALIVE_REQUEST,  <<"KING_ALIVE_REQUEST">>).
 -define(KING_ALIVE_RESPONSE, <<"KING_ALIVE_RESPONSE">>).
+-define(KING_IAM,            <<"KING_IAM">>).
 -define(MAX_FAIL_REQ, 3).
 
 -record(knode_packet, {message = undefined, who = #knode{}}).
 -record(king_checker_context, {king = #knode{}, failure_count = 0, success_count = 0, context = undefined}).
 -record(knode_config, {other, more, self = undefined}).
 -record(king_loop_context, {context = undefined, self = #knode{}}).
-
 
 -spec confval(Key, Default) -> Value when
   Key     :: string(),
@@ -36,24 +36,25 @@
   Bin     :: binary(),
   Packet  :: #knode_packet{}.
 
--spec king_find_king_default(Socket, Context) -> Result when
-  Socket  :: any(),
-  Context :: any(),
-  Result  :: #knode{}.
-
--spec king_checker_start(Node, Timeout, Context) -> {ok, Pid} when
+-spec king_checker_start(Node, Socket, Timeout, Context) -> {ok, Pid, Socket0} when
   Node    :: #knode{},
+  Socket  :: any(),
+  Socket0 :: any(),
   Timeout :: integer(),
   Context :: any(),
   Pid     :: pid().
--spec king_checker_start(Node, Timeout, FindFunc, Context) -> {ok, Pid} when
+-spec king_checker_start(Node, Socket, Timeout, FindFunc, Context) -> {ok, Pid, Socket0} when
   Node    :: #knode{},
+  Socket  :: any(),
+  Socket0 :: any(),
   Timeout :: integer(),
   FindFunc:: fun(),
   Context :: any(),
   Pid     :: pid().
--spec king_checker_start(Node, Timeout, FindFunc, Context, King) -> {ok, Pid} when
+-spec king_checker_start(Node, Socket, Timeout, FindFunc, Context, King) -> {ok, Pid, Socket0} when
   Node    :: #knode{},
+  Socket  :: any(),
+  Socket0 :: any(),
   Timeout :: integer(),
   FindFunc:: fun(),
   Context :: any(),
@@ -68,11 +69,12 @@
   Context :: any(),
   Result  :: none().
 
--spec king_loop_start(Timeout, Node, Context) -> {ok, Pid} when
+-spec king_loop_start(Timeout, Node, Context) -> {ok, Pid, Socket} when
   Timeout :: integer(),
   Node    :: #knode{},
   Context :: any(),
-  Pid     :: pid().
+  Pid     :: pid(),
+  Socket  :: any().
 
 -spec king_loop(Socket, Timeout, Context) -> Result when
   Socket  :: any(),
@@ -90,22 +92,92 @@
   Config  :: #knode_config{},
   Result  :: #knode_config{}.
 
+
+-spec king_find(Socket, Timeout, Context) -> Result when
+  Socket  :: any(),
+  Timeout :: integer(),
+  Context :: #knode_config{},
+  Result  :: #knode{}.
+
+-spec king_find(Socket, Timeout, Context, State) -> Result when
+  Socket  :: any(),
+  Timeout :: integer(),
+  Context :: #knode_config{},
+  State   :: 'request' | 'wait_king' | 'error' | 'wait_alive',
+  Result  :: #knode{}.
+
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+king_find(Socket, Timeout, Context) ->
+  king_find(Socket, Timeout, Context, request).
+
+king_find(Socket, Timeout, #knode_config{self = Node} = Context, State) ->
+  SendAlive = fun({_, #knode{host = Host, port = Port}}) ->
+    Packet = write_packet(#knode_packet{message = ?KING_ALIVE_REQUEST, who = Node}),
+    ok = gen_udp:send(Socket, Host, Port, Packet)
+  end,
+  SendAliveProcess = fun() ->
+    [ SendAlive(Node0) || Node0 <- ets:tab2list(Context#knode_config.more) ]
+  end,
+  Wait = fun(WaitFunc, State0, Circle) ->
+           inet:setopts(Socket, [{active, once}]),
+           receive
+             {udp, Socket, _, _, Bin} ->
+               case read_packet(Bin) of
+                 {ok, #knode_packet{who = #knode{id = Id}, message = ?KING_ALIVE_RESPONSE}} 
+                     when Id >=  Node#knode.id ->
+                   WaitFunc(WaitFunc, wait_king, 0);
+                 {ok, #knode_packet{who = #knode{id = Id} = WhoNode, message = ?KING_IAM}}
+                     when Id >=  Node#knode.id ->
+                   WhoNode;
+                 {error, Reason} ->
+                   io:format("Error: ~p~nTry again~n", [Reason]),
+                   WaitFunc(WaitFunc, error, Circle + 1)
+               end      
+           after Timeout ->
+             case State0 of
+               wait_king ->
+                 if
+                   Circle >= 100 ->
+                     king_find(Socket, Timeout, Context, request);
+                   true ->
+                     WaitFunc(WaitFunc, wait, Circle + 1)
+                 end;
+               error ->
+                 WaitFunc(WaitFunc, error, Circle + 1);
+               wait_alive ->
+                 Packet = write_packet(#knode_packet{message = ?KING_IAM, who = Node}),
+                 SendIam = fun({_, #knode{host = Host, port = Port}}) ->
+                             ok = gen_udp:send(Socket, Host, Port, Packet)
+                           end,
+                 [SendIam(Node0) || Node0 <- ets:tab2list(Context#knode_config.other)],
+                 Node  
+             end
+           end
+  end,
+  case State of
+    request ->
+      spawn_link(SendAliveProcess),
+      Wait(Wait, wait_alive, 0);
+    error ->
+      io:fromat("Call with error~n", []),
+      Wait(Wait, error, 0)
+  end.
+
 confval(Key, Default) ->
   case application:get_env(Key) of
     undefined -> Default;
     Val       -> Val
   end.
 
-
 start() ->
-  FindFunc = fun king_find_king_default/2,
+  FindFunc = fun king_find/3,
   KingLoopTimeout = confval(king_loop_timeout, 10000),
   KingCheckerTimeout = confval(king_checker_timeout, 1000),
   ConfigFile = confval(configfile, ?CONFIG_FILENAME),
   #knode_config{self = Node} = Config = read_config_file(ConfigFile),
-  {ok, KingLoopPid} = king_loop_start(KingLoopTimeout, Node, Config),
-  {ok, KingCheckerPid} = king_checker_start(Node, KingCheckerTimeout, FindFunc, Config),
+  {ok, KingLoopPid, Socket} = king_loop_start(KingLoopTimeout, Node, Config),
+  {ok, KingCheckerPid} = king_checker_start(Node, Socket, KingCheckerTimeout, FindFunc, Config),
   {ok, KingLoopPid, KingCheckerPid}.                                                     
 
 
@@ -135,26 +207,23 @@ read_packet_failure_test() ->
 -endif.
 
 %% @doc King manager
-king_find_king_default(_Socket, _Context) ->
-  #knode{}.
-
-king_checker_start(Node, Timeout, Context) ->
-  king_checker_start(Node, Timeout, fun king_find_king_default/2, Context).
+king_checker_start(Node, Socket, Timeout, Context) ->
+  king_checker_start(Node, Socket, Timeout, fun king_find/3, Context).
 
 
-king_checker_start(Node, Timeout, FindKingFunc, Context) ->
-  king_checker_start(Node, Timeout, FindKingFunc, Context, undefined).
+king_checker_start(Node, Socket, Timeout, FindKingFunc, Context) ->
+  king_checker_start(Node, Socket, Timeout, FindKingFunc, Context, undefined).
 
-king_checker_start(Node, Timeout, FindKingFunc, Context, King) ->
-  {ok, Socket} = gen_udp:open(0, [binary]),
+king_checker_start(Node, Socket, Timeout, FindKingFunc, Context, King) ->
+  ?debugFmt("Socket: ~p~n", [Socket]),
   Pid = spawn(?MODULE, king_checker, [Socket, Node, Timeout, FindKingFunc, #king_checker_context{king = King, context = Context}]),
   gen_udp:controlling_process(Socket, Pid),
-  {ok, Pid}.
+  {ok, Pid, Socket}.
 
 king_checker(Socket, Node, Timeout, FindKingFunc, #king_checker_context{failure_count = FailureCount, success_count = SuccessCount} = Context) ->
   FindKing = case Context#king_checker_context.king of
     undefined ->
-      FindKingFunc(Socket, Context#king_checker_context.context);
+      FindKingFunc(Socket, Timeout, Context#king_checker_context.context);
     King ->
       King
   end,
@@ -190,7 +259,7 @@ king_checker(Socket, Node, Timeout, FindKingFunc, #king_checker_context{failure_
 -ifdef(TEST).
 
 -spec king_checker_start_test1({Pid :: pid(), KingPort :: integer(), Timeout :: integer(), Context :: any()}) -> none().
-king_checker_start_test1({Pid, KingPort, Timeout, _}) ->
+king_checker_start_test1({Pid, _Socket, KingPort, Timeout, _}) ->
   AfterTimeout = Timeout * 50,
   {ok, Socket} = gen_udp:open(KingPort, [binary, {active, false}]),
   inet:setopts(Socket, [{active, once}]),
@@ -208,7 +277,7 @@ king_checker_start_test1({Pid, KingPort, Timeout, _}) ->
   ?_assertEqual(1, 1).
 
 -spec king_checker_start_test2({Pid :: pid(), KingPort :: integer(), Timeout :: integer(), Context :: any()}) -> none().
-king_checker_start_test2({_Pid, KingPort, Timeout, _Context}) ->
+king_checker_start_test2({_Pid, _Socket, KingPort, Timeout, _Context}) ->
   AfterTimeout = Timeout * 50,
   {ok, Socket} = gen_udp:open(KingPort, [binary, {active, false}]),
   inet:setopts(Socket, [{active, once}]),
@@ -223,7 +292,7 @@ king_checker_start_test2({_Pid, KingPort, Timeout, _Context}) ->
   ?_assertEqual(1, 1).
 
 -spec king_checker_start_test3({Pid :: pid(), KingPort :: integer(), Timeout :: integer(), Context :: any()}) -> none().
-king_checker_start_test3({Pid, _, _, _Context}) ->
+king_checker_start_test3({Pid, _, _, _, _Context}) ->
   link(Pid),
   Pid ! {internal, reboot, self()},
   receive
@@ -244,19 +313,23 @@ king_checker_start_test_() ->
     KingPort = 9090,
     Timeout = 100,
     Node = #knode{host = "localhost", port = 9090},
-    {ok, Pid} = king_checker_start(Node, Timeout, fun(_Socket, _Context) ->
+    Socket = gen_udp:open(KingPort, [binary, {active, false}]),
+    Func = fun(_Socket, _Timeout, _Context) ->
       #knode{host = "localhost", port = KingPort, id = 0}  
-    end, []),
-    {Pid, KingPort, Timeout, []}
+    end,
+    Result = king_checker_start(Node, Socket, Timeout, Func, []),
+    {ok, Pid, _} = Result,
+    {Pid, Socket, KingPort, Timeout, []}
   end,
-  fun({Pid, _KingPort, _Timeout, _Context}) ->
+  fun({Pid, Socket, _KingPort, _Timeout, _Context}) ->
     Pid ! {internal, terminate, self()},
     receive
       {ok, terminated} ->
         ?assertEqual(1, 1)
     after 2000 ->
       ?assertEqual(1, 0)
-    end       
+    end,
+    gen_udp:close(Socket)       
   end,
   [
     fun king_checker_start_test1/1,    
@@ -274,7 +347,7 @@ king_loop_start(Timeout, Node, Context) ->
   {ok, Socket} = gen_udp:open(Node#knode.port, [binary, {active, false}]),
   Pid = spawn(?MODULE, king_loop, [Socket, Timeout, #king_loop_context{context = Context, self = Node}]),
   gen_udp:controlling_process(Socket, Pid),
-  {ok, Pid}.
+  {ok, Pid, Socket}.
 
 king_loop(Socket, Timeout, Context) ->
   inet:setopts(Socket, [{active, once}]),

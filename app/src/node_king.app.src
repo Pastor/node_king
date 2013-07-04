@@ -9,5 +9,7 @@
                   mnesia
                  ]},
   {mod, { node_king_app, []}},
-  {env, []}
+  {env, [
+    {test1, "Test1"}
+  ]}
  ]}.
