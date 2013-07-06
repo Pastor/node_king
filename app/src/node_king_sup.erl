@@ -27,10 +27,10 @@ start_link() ->
 -spec init([]) -> {ok, { {atom(), integer(), integer()}, [any()] }}.
 init([]) ->
     io:format("node_king_sup:init()~n", []),
-    node_king_ddb:init_db([]),
-    NodeKingConf = ?CHILD(node_king_conf, worker),
+    %node_king_ddb:init_db([]),
+    NodeMain = ?CHILD(node_king_main, worker),
     Specs = [
-      NodeKingConf
+      NodeMain
     ],
     {ok, { {one_for_one, 5, 10}, Specs} }.
 

@@ -15,15 +15,30 @@
 
 -record(knode_packet, {message = undefined, who = #knode{}}).
 -record(king_checker_context, {king = #knode{}, failure_count = 0, success_count = 0, context = undefined}).
--record(knode_config, {other, more, self = undefined}).
+-record(knode_config, {other = [#knode{}], more = [#knode{}], self = undefined}).
 -record(king_loop_context, {context = undefined, self = #knode{}}).
+-record(king_find_context, {success = 0, failure = 0, global = 0}).
+
+-ifndef(TEST).
+-define(debugFmt, io:format).
+-endif.
 
 -spec confval(Key, Default) -> Value when
   Key     :: string(),
   Default :: string(),
   Value   :: string().
 
+-spec start_link() -> {ok, LoopPid, CheckPid} when
+  LoopPid :: pid(),
+  CheckPid:: pid().
+
+
 -spec start() -> {ok, LoopPid, CheckPid} when
+  LoopPid :: pid(),
+  CheckPid:: pid().
+
+-spec start(Config) -> {ok, LoopPid, CheckPid} when
+  Config  :: #knode_config{},
   LoopPid :: pid(),
   CheckPid:: pid().
 
@@ -96,69 +111,84 @@
   Context :: #knode_config{},
   Result  :: #knode{}.
 
--spec king_find(Socket, Timeout, Context, State) -> Result when
+-spec king_find(Socket, Timeout, Context, State, FindCtx) -> Result when
   Socket  :: any(),
   Timeout :: integer(),
   Context :: #knode_config{},
   State   :: 'request' | 'wait_king' | 'error' | 'wait_alive',
+  FindCtx :: #king_find_context{},
   Result  :: #knode{}.
 
 
+foreach_objects(Objects, Callback) ->
+  [ Callback(Object) || Object <- Objects ].
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 king_find(Socket, Timeout, Context) ->
-  king_find(Socket, Timeout, Context, request).
+  king_find(Socket, Timeout, Context, request, #king_find_context{}).
 
-king_find(Socket, Timeout, #knode_config{self = Node} = Context, State) ->
-  SendAlive = fun({_, #knode{host = Host, port = Port}}) ->
+king_find(Socket, Timeout, #knode_config{self = Node, more = MoreObjects} = Context, State, #king_find_context{failure = ErrorCount, success = SuccessCount, global = GlobalCount}) ->
+  ?debugFmt("Errors: ~p, Successes: ~p, Global: ~p, State: ~p~n", [ErrorCount, SuccessCount, GlobalCount, State]),
+  SendAlive = fun(#knode{host = Host, port = Port}) ->
     Packet = write_packet(#knode_packet{message = ?KING_ALIVE_REQUEST, who = Node}),
     ok = gen_udp:send(Socket, Host, Port, Packet)
   end,
-  SendAliveProcess = fun() ->
-    [ SendAlive(Node0) || Node0 <- ets:tab2list(Context#knode_config.more) ]
-  end,
-  Wait = fun(WaitFunc, State0, Circle) ->
-           inet:setopts(Socket, [{active, once}]),
-           receive
-             {udp, Socket, _, _, Bin} ->
-               case read_packet(Bin) of
-                 {ok, #knode_packet{who = #knode{id = Id}, message = ?KING_ALIVE_RESPONSE}} 
-                     when Id >=  Node#knode.id ->
-                   WaitFunc(WaitFunc, wait_king, 0);
-                 {ok, #knode_packet{who = #knode{id = Id} = WhoNode, message = ?KING_IAM}}
-                     when Id >=  Node#knode.id ->
-                   WhoNode;
-                 {error, Reason} ->
-                   io:format("Error: ~p~nTry again~n", [Reason]),
-                   WaitFunc(WaitFunc, error, Circle + 1)
-               end      
-           after Timeout ->
-             case State0 of
-               wait_king ->
-                 if
-                   Circle >= 100 ->
-                     king_find(Socket, Timeout, Context, request);
-                   true ->
-                     WaitFunc(WaitFunc, wait, Circle + 1)
-                 end;
-               error ->
-                 WaitFunc(WaitFunc, error, Circle + 1);
-               wait_alive ->
-                 Packet = write_packet(#knode_packet{message = ?KING_IAM, who = Node}),
-                 SendIam = fun({_, #knode{host = Host, port = Port}}) ->
-                             ok = gen_udp:send(Socket, Host, Port, Packet)
-                           end,
-                 [SendIam(Node0) || Node0 <- ets:tab2list(Context#knode_config.other)],
-                 Node  
-             end
-           end
-  end,
   case State of
     request ->
-      spawn_link(SendAliveProcess),
-      Wait(Wait, wait_alive, 0);
+      spawn_link(?MODULE, foreach_objects, [MoreObjects, SendAlive]),
+      king_find(Socket, Timeout, Context, wait_alive, #king_find_context{success = SuccessCount + 1, global = GlobalCount + 1});
     error ->
-      io:fromat("Call with error~n", []),
-      Wait(Wait, error, 0)
+      ?debugFmt("Call with error~n", []),
+      if 
+        ErrorCount > 1000 ->
+          king_find(Socket, Timeout, Context, request, #king_find_context{failure = 0, global = GlobalCount + 1});
+        true ->
+          king_find(Socket, Timeout, Context, wait_king, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1})
+      end;
+    _ ->
+      inet:setopts(Socket, [{active, once}]),
+      receive
+        {udp, Socket, _, _, Bin} ->
+          case read_packet(Bin) of
+            {ok, #knode_packet{who = #knode{id = Id}, message = ?KING_ALIVE_RESPONSE}} 
+                when Id >  Node#knode.id ->
+              king_find(Socket, Timeout, Context, wait_king, #king_find_context{success = 0, global = GlobalCount + 1});
+            {ok, #knode_packet{who = #knode{id = Id} = WhoNode, message = ?KING_IAM}}
+                when Id >  Node#knode.id ->
+              WhoNode;
+            {error, Reason} ->
+              io:format("Error: ~p~nTry again~n", [Reason]),
+              king_find(Socket, Timeout, Context, error, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1})
+          end;
+        {udp_error, _Socket, Reason} ->
+          ?debugFmt("Socket error: ~p~n", [Reason]),
+          king_find(Socket, Timeout, Context, error, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1});
+        Result ->
+          ?debugFmt("KingFind receive: ~p~n", [Result]),
+          king_find(Socket, Timeout, Context, error, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1})
+      after Timeout ->
+        case State of
+          wait_king ->
+            if
+              SuccessCount >= 10 ->
+                king_find(Socket, Timeout, Context, request, #king_find_context{success = SuccessCount + 1, global = GlobalCount + 1});
+              true ->
+                king_find(Socket, Timeout, Context, wait_king, #king_find_context{success = SuccessCount + 1, global = GlobalCount + 1})
+            end;
+          error ->
+            king_find(Socket, Timeout, Context, error, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1});
+          wait_alive ->
+            Packet = write_packet(#knode_packet{message = ?KING_IAM, who = Node}),
+            SendIam = fun(#knode{host = Host, port = Port}) ->
+                        ok = gen_udp:send(Socket, Host, Port, Packet)
+                      end,
+            [SendIam(Node0) || Node0 <- Context#knode_config.other],
+            Node;
+          _ ->
+            ?debugFmt("Illegal state: ~p~n", [State]),
+            king_find(Socket, Timeout, Context, error, #king_find_context{failure = ErrorCount + 1, global = GlobalCount + 1})
+        end
+      end
   end.
 
 confval(Key, Default) ->
@@ -167,16 +197,62 @@ confval(Key, Default) ->
     Val       -> Val
   end.
 
-start() ->
-  FindFunc = fun king_find/3,
-  KingLoopTimeout = confval(king_loop_timeout, 10000),
-  KingCheckerTimeout = confval(king_checker_timeout, 1000),
-  ConfigFile = confval(configfile, ?CONFIG_FILENAME),
-  #knode_config{self = Node} = Config = read_config_file(ConfigFile),
-  {ok, KingLoopPid, _Socket} = king_loop_start(KingLoopTimeout, Node, Config),
-  {ok, KingCheckerPid, _Socket0} = king_checker_start(Node, KingCheckerTimeout, FindFunc, Config),
-  {ok, KingLoopPid, KingCheckerPid}.                                                     
+start_link() ->
+  start().
 
+start() ->
+  ConfigFile = confval(configfile, ?CONFIG_FILENAME),
+  ?debugFmt("Start reading config: ~p~n", [ConfigFile]),
+  {ok, Config} = read_config_file(ConfigFile),  
+  start(Config).
+
+start(#knode_config{self = Node} = Config) ->
+  ?debugFmt("Call start~n", []),
+  case Node of
+    undefined ->
+      {error, "Illegal config"};
+    _ ->
+      FindFunc = fun king_find/3,
+      KingLoopTimeout = confval(king_loop_timeout, 1000),
+      KingCheckerTimeout = confval(king_checker_timeout, 1000),
+      {ok, KingLoopPid, _SocketLoop} = king_loop_start(KingLoopTimeout, Node, Config),
+      {ok, KingCheckerPid, _SocketChecker} = king_checker_start(Node, KingCheckerTimeout, FindFunc, Config),
+      {ok, KingLoopPid, KingCheckerPid}
+  end.
+
+-ifdef(TEST).
+
+-spec start_full_test() -> none().
+start_full_test() ->
+  MyNode  = #knode{
+    host  = "localhost", 
+    port  = 10101, 
+    uuid  = "Unknown_UUID", 
+    id    = 100, 
+    type  = 0, 
+    name  = "My Node", 
+    self  = true, 
+    alive = true
+  },
+  NodeConfig = #knode_config{
+    self  = MyNode,
+    more  = [],
+    other = []
+  },
+  case start(NodeConfig) of
+    {ok, LoopPid, CheckerPid} ->
+      receive
+      after 4000 ->
+        LoopPid    ! {internal, terminate, self()},
+        CheckerPid ! {internal, terminate, self()}
+      end;
+    {error, Reason} ->
+      ?debugFmt("Error: ~p~n", [Reason]),
+      ?assertEqual(1, 0)  
+  end,  
+  ?assertEqual(1, 1).
+
+-endif.
 
 %% @doc Packet work
 read_packet(Bin) ->
@@ -218,11 +294,22 @@ king_checker_start(Node, Timeout, FindKingFunc, Context, King) ->
   {ok, Pid, Socket}.
 
 king_checker(Socket, Node, Timeout, FindKingFunc, #king_checker_context{failure_count = FailureCount, success_count = SuccessCount} = Context) ->
+  ?debugFmt("Context#king_checker_context.king: ~p~n", [Context#king_checker_context.king]),
   FindKing = case Context#king_checker_context.king of
     undefined ->
       FindKingFunc(Socket, Timeout, Context#king_checker_context.context);
     King ->
       King
+  end,
+  case FindKing of
+    Node ->
+      receive
+      after Timeout ->
+        ?debugFmt("I am a robot. Who next?~n", []),
+        king_checker(Socket, Node, Timeout, FindKingFunc, Context#king_checker_context{success_count = SuccessCount + 1, failure_count = 0, king = FindKing})  
+      end;
+    _ ->
+      FindKing
   end,
   Packet = write_packet(#knode_packet{message = ?KING_ALIVE_REQUEST, who = Node}),
   ok = gen_udp:send(Socket, FindKing#knode.host, FindKing#knode.port, Packet),
@@ -232,7 +319,7 @@ king_checker(Socket, Node, Timeout, FindKingFunc, #king_checker_context{failure_
         {ok, #knode_packet{message = ?KING_ALIVE_RESPONSE, who = FindKing}} ->
           king_checker(Socket, Node, Timeout, FindKingFunc, Context#king_checker_context{success_count = SuccessCount + 1, failure_count = 0});
         {error, Error} ->
-          io:format("Error: ~p~n", [Error])
+          ?debugFmt("Error: ~p~n", [Error])
       end;
     %% Internal reboot
     {internal, reboot, Pid} ->
@@ -247,7 +334,7 @@ king_checker(Socket, Node, Timeout, FindKingFunc, #king_checker_context{failure_
       FailureCount >= ?MAX_FAIL_REQ ->
         undefined; 
       true ->
-        Context#king_checker_context.king
+        FindKing
     end,
     king_checker(Socket, Node, Timeout, FindKingFunc, Context#king_checker_context{failure_count = FailureCount + 1, king = King0})
   end,
@@ -347,37 +434,64 @@ king_loop_start(Timeout, Node, Context) ->
 king_loop(Socket, Timeout, Context) ->
   inet:setopts(Socket, [{active, once}]),
   receive
-    {udp, Socket, HostName, Port, Bin} ->
+    {udp, Socket, _HostName, _Port, Bin} ->
       case read_packet(Bin) of
-        {ok, #knode_packet{message = ?KING_ALIVE_REQUEST}} ->
-          Bin = write_packet(#knode_packet{message = ?KING_ALIVE_RESPONSE, who = Context#king_loop_context.self}),
-          gen_udp:send(Socket, HostName, Port, Bin);
+        {ok, #knode_packet{message = Message, who = #knode{host = WhoHost, port = WhoPort}} = WhoNode} ->
+          case Message of
+            ?KING_ALIVE_REQUEST -> 
+              ResponseBin = write_packet(#knode_packet{message = ?KING_ALIVE_RESPONSE, who = Context#king_loop_context.self}),
+              gen_udp:send(Socket, WhoHost, WhoPort, ResponseBin);
+            ?KING_ALIVE_RESPONSE ->
+              if 
+                WhoNode =:= Context#king_loop_context.self ->
+                  ?debugFmt("Self messaging~n", []);
+                true ->
+                  ?debugFmt("Response from: ~p~n", [WhoNode])
+              end
+          end;
         {error, Message} ->
-          io:format("Exception: ~p~n", [Message])
+          ?debugFmt("Exception: ~p~n", [Message]);
+        Result ->
+          ?debugFmt("Result: ~p~n", [Result])
       end,
+      king_loop(Socket, Timeout, Context);
+    %%
+    {internal, terminate, Pid} ->
+      Pid ! {ok, terminated};
+    %%
+    Other ->
+      ?debugFmt("Other receive: ~p~n", [Other]),
       king_loop(Socket, Timeout, Context)
   after Timeout ->
-    io:format("Timeout~n", []),
+    ?debugFmt("Timeout~n", []),
     king_loop(Socket, Timeout, Context)
   end.
 
 %% @doc config reader
 read_config_file(FileName) ->
+  ?debugFmt("read_config_file~n", []),
+  NodeConfig = #knode_config{
+    more  = [],
+    other = [],
+    self  = undefined  
+  },
   ParseTermsFunc = fun
-    (#knode{self = true} = Node, NodeConfig) ->
-      NodeConfig#knode_config{self = Node};
-    (Node, NodeConfig) ->
-      ets:insert(NodeConfig#knode_config.other, {Node#knode.uuid, Node}),
-      NodeConfig      
+    (#knode{self = true} = Node, NodeConfig0) ->
+      NodeConfig0#knode_config{self = Node};
+    (Node, NodeConfig0) ->
+      Other = NodeConfig0#knode_config.other ++ [Node],
+      NodeConfig0#knode_config{other = Other}      
   end,
+  ?debugFmt("Open file~n", []),
   Result = case file:open(FileName, [read]) of
     {ok, Device} ->
+      ?debugFmt("Read lines~n", []),
       read_config_line(Device, fun
-        (Line, NodeConfig) ->
+        (Line, NodeConfig0) ->
           {ok, Tokens, _} = erl_scan:string(Line),
           case Tokens of
             [] ->
-              NodeConfig;
+              NodeConfig0;
             _ ->
               {ok, {Uuid, Name, Host, Port, Type, Id, Self}} = erl_parse:parse_term(Tokens),
               ParseTermsFunc(#knode{
@@ -389,25 +503,29 @@ read_config_file(FileName) ->
                 id = Id,
                 self = Self,
                 alive = true
-              }, NodeConfig)
+              }, NodeConfig0)
           end
-      end, #knode_config{
-        more  = ets:new(?MODULE, [bag, {keypos, 2}]),
-        other = ets:new(?MODULE, [bag, {keypos, 2}]),
-        self  = undefined  
-      });    
+      end, NodeConfig);    
     {error, Reason} ->
-      io:format("Error ~p~n", [Reason]),
-      #knode_config{}  
+      ?debugFmt("Error ~p~n", [Reason]),
+      NodeConfig  
   end, 
+  ?debugFmt("Check result~n", []),
   case  Result#knode_config.self of
     undefined ->
       {ok, Result};
     #knode{id = Id} ->
-      More = [{Uuid, Node} || {Uuid, #knode{id = ElemId} = Node} <- ets:tab2list(Result#knode_config.other), ElemId >= Id],
-      [ets:delete(Result#knode_config.other, Uuid) || {Uuid, _} <- More],
-      ets:insert(Result#knode_config.more, More),
-      {ok, Result}
+      {More, Other} = lists:foldl(fun(#knode{id = ElementId} = Element, {More, Other}) ->
+        if
+          ElementId > Id ->
+            {More ++ [Element], Other};
+          ElementId =:= Id ->
+            {More, Other};
+          true ->
+            {More, Other ++ [Element]}
+        end    
+      end, {[], []}, Result#knode_config.other),
+      {ok, Result#knode_config{more = More, other = Other}}
   end.
   
 read_config_line(Device, Func, Accum) ->
@@ -433,12 +551,9 @@ node_config_self_test() ->
 node_config_count_test() ->
   {ok, CurrentDirectory} = file:get_cwd(),
   ConfigFileName = CurrentDirectory ++ "/../../node_king.config",
-  io:format("~p~n", [ConfigFileName]),
   {ok, NodeConfig} = read_config_file(ConfigFileName),
-  OtherList = ets:tab2list(NodeConfig#knode_config.other),
-  OtherCount = length(OtherList),
-  MoreList = ets:tab2list(NodeConfig#knode_config.more),
-  MoreCount = length(MoreList),
+  OtherCount = length(NodeConfig#knode_config.other),
+  MoreCount = length(NodeConfig#knode_config.more),
   ?assert(OtherCount >= 1),
   ?assert(MoreCount >= 1).
 
