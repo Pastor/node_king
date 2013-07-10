@@ -1,0 +1,15 @@
+{application, exp,
+ [
+  {description, "Example"},
+  {vsn, "0.1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  mnesia
+                 ]},
+  {mod, { exp_server, []}},
+  {env, [
+    {configfile, ""}
+  ]}
+ ]}.
